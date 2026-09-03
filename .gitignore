@@ -184,3 +184,15 @@ tmp/
 # Log files
 *.log
 logs/
+
+# -----------------------------------------------------------------------------
+# Lokale rommel (niet meecommitten)
+# -----------------------------------------------------------------------------
+# Zip die we maken om het project over te zetten
+*.zip
+
+# Handmatige backups van broncode
+*.bak
+
+# Bestanden die weg mogen maar niet verwijderd konden worden
+_to_delete/

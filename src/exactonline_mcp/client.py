@@ -26,6 +26,7 @@ from exactonline_mcp.exceptions import (
     NetworkError,
     RateLimitError,
 )
+from exactonline_mcp.http_auth import get_bearer_token, passthrough_enabled
 from exactonline_mcp.models import (
     ACCOUNT_TYPE_CATEGORIES,
     AgingEntry,
@@ -186,7 +187,11 @@ class ExactOnlineClient:
         self.client_secret = client_secret or os.getenv("EXACT_ONLINE_CLIENT_SECRET", "")
         self.region = region or os.getenv("EXACT_ONLINE_REGION", "nl")
 
-        if not self.client_id or not self.client_secret:
+        # In passthrough mode the calling MCP client owns the OAuth2 flow, so
+        # this process needs no credentials of its own.
+        self._passthrough = passthrough_enabled()
+
+        if not self._passthrough and (not self.client_id or not self.client_secret):
             raise ValueError(
                 "Missing EXACT_ONLINE_CLIENT_ID or EXACT_ONLINE_CLIENT_SECRET"
             )
@@ -221,12 +226,29 @@ class ExactOnlineClient:
     async def _ensure_authenticated(self) -> str:
         """Ensure we have a valid access token.
 
+        In passthrough mode the token arrives with the request and is returned
+        as-is. It is deliberately not cached on this instance: the client is a
+        process-wide singleton shared by every caller, so caching would leak
+        one user's token to another.
+
         Returns:
             Valid access token.
 
         Raises:
             AuthenticationError: If authentication fails.
         """
+        if self._passthrough:
+            token = get_bearer_token()
+            if not token:
+                raise AuthenticationError(
+                    message="No Exact Online access token was sent with this request",
+                    action=(
+                        "Connect this tool to your Exact Online account in the "
+                        "MCP client so it sends an Authorization: Bearer header"
+                    ),
+                )
+            return token
+
         # Get token from storage if not cached, or if expired
         if self._current_token is None or self._current_token.is_expired():
             self._current_token = await self.oauth_client.get_valid_token()
@@ -284,6 +306,20 @@ class ExactOnlineClient:
 
                 # Handle auth errors
                 if response.status_code == 401:
+                    if self._passthrough:
+                        # The token belongs to the calling client, so there is
+                        # nothing to refresh here. Retrying would only repeat
+                        # the same rejected token.
+                        raise AuthenticationError(
+                            message=(
+                                "The Exact Online access token has expired or "
+                                "was revoked"
+                            ),
+                            action=(
+                                "Reconnect the Exact Online connection in your "
+                                "MCP client and try again"
+                            ),
+                        )
                     # Token might have been revoked, clear and retry
                     self._current_token = None
                     if attempt < self.MAX_RETRIES - 1:

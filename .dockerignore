@@ -1,0 +1,24 @@
+# Keep the build context small: az containerapp up uploads it to Azure and
+# caps it at 200 MB.
+.venv/
+.git/
+.github/
+__pycache__/
+*.pyc
+*.pyo
+*.bak
+*.zip
+
+# Never ship secrets or local tokens into an image.
+.env
+.env.*
+!.env.example
+tokens.json.enc
+tokens.key
+
+# Not needed at runtime.
+specs/
+.specify/
+.claude/
+tests/
+SETUP-NIEUWE-LAPTOP.md

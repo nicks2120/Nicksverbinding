@@ -228,7 +228,7 @@ def get_storage() -> TokenStorage:
 
         # Test if keyring is functional
         keyring.get_password("exactonline-mcp-test", "test")
-        return KeyringStorage()
+        return EncryptedFileStorage()  # patch: Windows Credential Manager kan de tokens niet opslaan
     except Exception:
         logger.info("Keyring not available, using encrypted file storage")
         return EncryptedFileStorage()
