@@ -168,6 +168,13 @@ class ExactOnlineClient:
     MAX_RETRIES = 3
     RETRY_BACKOFF_BASE = 2  # seconds
 
+    # Exact Online returns at most 60 records per response on regular endpoints
+    # and puts the link to the next batch in d.__next. A client that ignores
+    # that link silently sees only the first 60 records, so every list here is
+    # fetched by following __next until it runs out. MAX_PAGES stops a very
+    # broad question from looping forever; 100 pages is roughly 6000 records.
+    MAX_PAGES = 100
+
     def __init__(
         self,
         client_id: str | None = None,
@@ -222,6 +229,59 @@ class ExactOnlineClient:
         if self._http_client is not None:
             await self._http_client.aclose()
             self._http_client = None
+
+    @staticmethod
+    def _extract_page(data: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        """Split an Exact Online response into its records and next-page link.
+
+        Args:
+            data: Parsed JSON body of a response.
+
+        Returns:
+            Tuple of (records, next_url). next_url is None on the last page.
+        """
+        d = data.get("d", [])
+        if isinstance(d, dict):
+            return d.get("results", []), d.get("__next")
+        return (d if isinstance(d, list) else []), None
+
+    async def _collect_pages(
+        self,
+        url: str,
+        max_records: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch every page of a result set by following Exact's __next links.
+
+        Args:
+            url: Fully built URL of the first page.
+            max_records: Stop once this many records are collected.
+
+        Returns:
+            All records found, capped at max_records when given.
+        """
+        records: list[dict[str, Any]] = []
+        pages = 0
+
+        while url and pages < self.MAX_PAGES:
+            response = await self._request("GET", url)
+            page, url = self._extract_page(response.json())
+            records.extend(page)
+            pages += 1
+
+            if max_records is not None and len(records) >= max_records:
+                return records[:max_records]
+            if not page:
+                break
+
+        if url:
+            logger.warning(
+                "Stopped after %d pages (%d records) but Exact Online has more. "
+                "Narrow the date range or filter to get a complete answer.",
+                pages,
+                len(records),
+            )
+
+        return records
 
     async def _ensure_authenticated(self) -> str:
         """Ensure we have a valid access token.
@@ -404,10 +464,9 @@ class ExactOnlineClient:
         url = f"{self.base_url}/api/v1/{current_division}/hrm/Divisions"
         url += "?$select=Code,Description,HID&$orderby=Description"
 
-        response = await self._request("GET", url)
-        data = response.json()
-
-        results = data.get("d", {}).get("results", [])
+        # Paginated: an administration office can easily have more than the 60
+        # divisions Exact returns in a single response.
+        results = await self._collect_pages(url)
 
         divisions = []
         for item in results:
@@ -432,6 +491,7 @@ class ExactOnlineClient:
         top: int | None = None,
         skip: int | None = None,
         orderby: str | None = None,
+        paginate: bool = False,
     ) -> dict[str, Any]:
         """Make a GET request to any Exact Online API endpoint.
 
@@ -440,12 +500,17 @@ class ExactOnlineClient:
             division: Division code.
             select: OData $select parameter.
             filter: OData $filter parameter.
-            top: OData $top parameter (max records).
+            top: Maximum number of records. With paginate=True this is applied
+                across pages instead of being sent as $top, because Exact
+                caps a single response at 60 records regardless.
             skip: OData $skip parameter (pagination offset).
             orderby: OData $orderby parameter.
+            paginate: Follow Exact's __next links and return every record.
+                Leave False only for calls that genuinely want one record.
 
         Returns:
-            API response data.
+            API response data, always shaped as {"d": {"results": [...]}} when
+            paginate is True.
 
         Raises:
             ExactOnlineError: On API errors.
@@ -458,7 +523,7 @@ class ExactOnlineClient:
             params["$select"] = select
         if filter:
             params["$filter"] = filter
-        if top:
+        if top and not paginate:
             params["$top"] = str(top)
         if skip:
             params["$skip"] = str(skip)
@@ -469,6 +534,9 @@ class ExactOnlineClient:
             url += "?" + urlencode(params)
 
         try:
+            if paginate:
+                records = await self._collect_pages(url, max_records=top)
+                return {"d": {"results": records}}
             response = await self._request("GET", url)
             return response.json()
         except DivisionNotAccessibleError as e:
@@ -551,9 +619,13 @@ class ExactOnlineClient:
         select: str | None = None,
         filter: str | None = None,
         orderby: str | None = None,
-        page_size: int = 1000,
+        max_records: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch all records from an endpoint with automatic pagination.
+        """Fetch all records from an endpoint, following Exact's __next links.
+
+        Exact Online decides the page size itself (60 on regular endpoints) and
+        links to the next batch in d.__next. Asking for a larger $top does not
+        change that, so there is nothing to configure here.
 
         Args:
             endpoint: API endpoint path.
@@ -561,44 +633,27 @@ class ExactOnlineClient:
             select: OData $select parameter.
             filter: OData $filter parameter.
             orderby: OData $orderby parameter.
-            page_size: Records per page (max 1000).
+            max_records: Stop once this many records are collected.
 
         Returns:
             List of all records from the endpoint.
         """
-        all_results: list[dict[str, Any]] = []
-        skip = 0
+        url = f"{self.base_url}/api/v1/{division}/{endpoint}"
 
-        while True:
-            data = await self.get(
-                endpoint=endpoint,
-                division=division,
-                select=select,
-                filter=filter,
-                top=page_size,
-                skip=skip,
-                orderby=orderby,
-            )
+        params = {}
+        if select:
+            params["$select"] = select
+        if filter:
+            params["$filter"] = filter
+        if orderby:
+            params["$orderby"] = orderby
+        if params:
+            url += "?" + urlencode(params)
 
-            # Extract results
-            d = data.get("d", [])
-            if isinstance(d, dict):
-                results = d.get("results", [])
-            else:
-                results = d if isinstance(d, list) else []
-
-            if not results:
-                break
-
-            all_results.extend(results)
-
-            # If we got fewer than page_size, we're done
-            if len(results) < page_size:
-                break
-
-            skip += page_size
-
-        return all_results
+        try:
+            return await self._collect_pages(url, max_records=max_records)
+        except DivisionNotAccessibleError as e:
+            raise DivisionNotAccessibleError(division) from e
 
     def build_date_filter(
         self,
@@ -1297,6 +1352,7 @@ class ExactOnlineClient:
         data = await self.get(
             endpoint="read/financial/AgingReceivablesList",
             division=division,
+            paginate=True,
         )
 
         d = data.get("d", [])
@@ -1335,6 +1391,7 @@ class ExactOnlineClient:
         data = await self.get(
             endpoint="read/financial/AgingPayablesList",
             division=division,
+            paginate=True,
         )
 
         d = data.get("d", [])
@@ -1406,6 +1463,7 @@ class ExactOnlineClient:
             select=",".join(select_fields),
             top=min(top, 1000),
             orderby="DueDate",
+            paginate=True,
         )
 
         d = data.get("d", [])
@@ -1493,6 +1551,7 @@ class ExactOnlineClient:
             select="ID,Date,FinancialYear,FinancialPeriod,GLAccountCode,GLAccountDescription,Description,AmountDC,EntryNumber,JournalCode",
             top=limit,
             orderby="Date desc",
+            paginate=True,
         )
 
         d = data.get("d", [])
@@ -1582,6 +1641,7 @@ class ExactOnlineClient:
             select=",".join(select_fields),
             top=min(top, 1000),
             orderby="Date desc",
+            paginate=True,
         )
 
         d = data.get("d", [])
@@ -1647,6 +1707,7 @@ class ExactOnlineClient:
             select=",".join(select_fields),
             top=min(top, 1000),
             orderby="InvoiceDate desc",
+            paginate=True,
         )
 
         d = data.get("d", [])
