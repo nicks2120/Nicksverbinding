@@ -1,7 +1,6 @@
 # exactonline-mcp
 
-A Model Context Protocol (MCP) server providing read-only access to Exact Online accounting data. Query your financial data, revenue reports, and account balances directly from Claude.
-
+A Model Context Protocol (MCP) server providing read-only access to Exact Online accounting data. 
 ## Features
 
 - **18 tools** for querying Exact Online data
